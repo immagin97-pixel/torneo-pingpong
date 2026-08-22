@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   TournamentState,
   Player,
@@ -7,17 +7,13 @@ import {
   StandingRow,
   PlayerStats
 } from '../types/tournament';
-import { createInitialTournamentState, INITIAL_PLAYERS } from '../data/initialData';
-import { applyPoint, undoLastPoint, setPalSaque } from '../core/rules';
+import { createInitialTournamentState } from '../data/initialData';
 import { calculateStandings } from '../core/standings';
-import { deriveBracketMatches, getBracketStructure, BracketData } from '../core/bracket';
+import { getBracketStructure, BracketData } from '../core/bracket';
 import { getPlayerStats } from '../core/stats';
-import {
-  generateBalancedInitialSchedule,
-  recalculateAllMatchTimes,
-  shiftPendingMatchTimes
-} from '../core/schedule';
 import confetti from 'canvas-confetti';
+
+export type ConnectionState = 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED';
 
 interface TournamentContextType {
   state: TournamentState;
@@ -29,157 +25,192 @@ interface TournamentContextType {
   selectedPlayerStatsId: string | null;
   setSelectedPlayerStatsId: (id: string | null) => void;
   selectedPlayerStats: PlayerStats | null;
+  connectionState: ConnectionState;
   isConnected: boolean;
   isAdminUnlocked: boolean;
+  adminPin: string;
   unlockAdmin: (pin: string) => boolean;
   lockAdmin: () => void;
-  // Core scoring & tournament actions
-  recordPoint: (matchId: string, winnerPlayerId: string) => void;
-  undoPoint: (matchId: string) => void;
-  setPalSaqueServer: (matchId: string, serverId: string) => void;
-  startMatch: (matchId: string) => void;
-  updateMatch: (matchId: string, partial: Partial<Match>) => void;
+  // Core scoring & tournament actions (routed to backend)
+  recordPoint: (matchId: string, winnerPlayerId: string) => Promise<void>;
+  undoPoint: (matchId: string) => Promise<void>;
+  setPalSaqueServer: (matchId: string, serverId: string) => Promise<void>;
+  startMatch: (matchId: string) => Promise<void>;
+  updateMatch: (matchId: string, partial: Partial<Match>) => Promise<void>;
   // Schedule & Calendar management actions
-  updateMatchSchedule: (matchId: string, scheduledTime: string) => void;
-  updateMatchPairing: (matchId: string, player1Id: string, player2Id: string) => void;
-  swapMatchOrder: (index1: number, index2: number) => void;
-  recalculateAllSchedules: (startTime?: string, durationMinutes?: number) => void;
-  shiftPendingSchedules: (minutesDelta: number) => void;
-  resetInitialScheduleToDefault: () => void;
+  updateMatchSchedule: (matchId: string, scheduledTime: string) => Promise<void>;
+  updateMatchPairing: (matchId: string, player1Id: string, player2Id: string) => Promise<void>;
+  swapMatchOrder: (index1: number, index2: number) => Promise<void>;
+  recalculateAllSchedules: (startTime?: string, durationMinutes?: number) => Promise<void>;
+  shiftPendingSchedules: (minutesDelta: number) => Promise<void>;
+  resetInitialScheduleToDefault: () => Promise<void>;
   // Players & config actions
-  updatePlayer: (player: Player) => void;
-  addPlayer: (player: Omit<Player, 'id' | 'createdAt'>) => void;
-  deletePlayer: (playerId: string) => void;
-  updateConfig: (partialConfig: Partial<TournamentConfig>) => void;
-  resetTournament: (preservePlayers?: boolean) => void;
-  populateDemoResults: () => void;
+  updatePlayer: (player: Player) => Promise<void>;
+  addPlayer: (player: Omit<Player, 'id' | 'createdAt'>) => Promise<void>;
+  deletePlayer: (playerId: string) => Promise<void>;
+  updateConfig: (partialConfig: Partial<TournamentConfig>) => Promise<void>;
+  resetTournament: (preservePlayers?: boolean) => Promise<void>;
+  populateDemoResults: () => Promise<void>;
 }
 
-const STORAGE_KEY = 'pingpong_tournament_state_v1';
-const BROADCAST_CHANNEL_NAME = 'pingpong_realtime_channel';
+// Compute API and WS URLs dynamically from environment variable or window location
+function getBackendUrls() {
+  const envApiUrl = import.meta.env.VITE_API_URL;
+  let httpUrl = envApiUrl;
+
+  if (!httpUrl) {
+    if (typeof window !== 'undefined') {
+      const hostname = window.location.hostname;
+      // If accessed via localhost or port 5173, point to backend on port 3001
+      if (hostname === 'localhost' || hostname === '127.0.0.1') {
+        httpUrl = `http://${hostname}:3001`;
+      } else {
+        httpUrl = `${window.location.protocol}//${window.location.host}`;
+      }
+    } else {
+      httpUrl = 'http://localhost:3001';
+    }
+  }
+
+  // Remove trailing slash if present
+  httpUrl = httpUrl.replace(/\/$/, '');
+
+  // Derive WebSocket URL (https -> wss, http -> ws)
+  let wsUrl = httpUrl.replace(/^http/, 'ws');
+
+  return { httpUrl, wsUrl };
+}
+
+const { httpUrl: API_BASE_URL, wsUrl: WS_BASE_URL } = getBackendUrls();
 
 const TournamentContext = createContext<TournamentContextType | null>(null);
 
 export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [state, setState] = useState<TournamentState>(() => {
-    try {
-      const local = localStorage.getItem(STORAGE_KEY);
-      if (local) {
-        return JSON.parse(local);
-      }
-    } catch (e) {
-      console.error('Error reading localStorage:', e);
-    }
-    return createInitialTournamentState();
-  });
-
+  // Pure in-memory reactive state (authoritative state lives solely in backend tournament_state.json)
+  const [state, setState] = useState<TournamentState>(() => createInitialTournamentState());
   const [activeMatchId, setActiveMatchId] = useState<string | null>(null);
   const [selectedPlayerStatsId, setSelectedPlayerStatsId] = useState<string | null>(null);
-  const [isConnected, setIsConnected] = useState(false);
+  const [connectionState, setConnectionState] = useState<ConnectionState>('RECONNECTING');
+  const [adminPin, setAdminPin] = useState<string>('1234');
   const [isAdminUnlocked, setIsAdminUnlocked] = useState(false);
 
-  const broadcastChannel = useMemo(() => {
-    try {
-      if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
-        return new BroadcastChannel(BROADCAST_CHANNEL_NAME);
-      }
-    } catch (e) {
-      console.warn('BroadcastChannel not supported', e);
-    }
-    return null;
-  }, []);
+  const wsRef = useRef<WebSocket | null>(null);
+  const pollTimerRef = useRef<number | null>(null);
 
-  const syncState = useCallback(
-    (newState: TournamentState, notifyNetwork = true) => {
-      setState(newState);
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(newState));
-      } catch (e) {
-        console.error('Error saving to localStorage:', e);
+  // Helper for authenticated API calls
+  const apiFetch = useCallback(
+    async (endpoint: string, options: RequestInit = {}) => {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'x-admin-pin': adminPin,
+        ...(options.headers as Record<string, string> || {})
+      };
+
+      const res = await fetch(`${API_BASE_URL}${endpoint}`, {
+        ...options,
+        headers
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.error || `Error ${res.status}: ${res.statusText}`);
       }
 
-      if (notifyNetwork) {
-        if (broadcastChannel) {
-          broadcastChannel.postMessage({ type: 'STATE_UPDATED', payload: newState });
-        }
-        fetch('http://localhost:3001/api/tournament/sync', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(newState)
-        }).catch(() => {});
-      }
+      return res.json();
     },
-    [broadcastChannel]
+    [adminPin]
   );
 
-  useEffect(() => {
-    let ws: WebSocket | null = null;
-    let reconnectTimeout: number | undefined;
+  // Fetch full state from backend
+  const fetchStateFromBackend = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/tournament`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.data) {
+          setState(data.data);
+          setConnectionState('CONNECTED');
+        }
+      } else {
+        setConnectionState('DISCONNECTED');
+      }
+    } catch {
+      setConnectionState('DISCONNECTED');
+    }
+  }, []);
 
-    function connect() {
+  // WebSocket Connection & Real-Time Sync
+  useEffect(() => {
+    let reconnectTimeout: number | undefined;
+    let isUnmounted = false;
+
+    function connectWs() {
+      if (isUnmounted) return;
+      setConnectionState('RECONNECTING');
+
       try {
-        ws = new WebSocket('ws://localhost:3001');
+        const ws = new WebSocket(WS_BASE_URL);
+        wsRef.current = ws;
 
         ws.onopen = () => {
-          setIsConnected(true);
+          if (isUnmounted) return;
+          setConnectionState('CONNECTED');
+          console.log('📡 Conectado al WebSocket del Torneo en', WS_BASE_URL);
+          // Sync state immediately upon connection
+          fetchStateFromBackend();
         };
 
         ws.onmessage = (event) => {
           try {
-            const data = JSON.parse(event.data);
-            if (data.type === 'STATE_SYNC' || data.type === 'STATE_UPDATED') {
-              if (data.payload && data.payload.version > (state.version || 0)) {
-                syncState(data.payload, false);
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'tournament_state_updated' || msg.type === 'STATE_UPDATED' || msg.type === 'STATE_SYNC') {
+              if (msg.payload) {
+                setState(msg.payload);
+                setConnectionState('CONNECTED');
               }
             }
           } catch (err) {
-            console.error('Error processing WS message:', err);
+            console.error('[WS Error parsing message]:', err);
           }
         };
 
         ws.onclose = () => {
-          setIsConnected(false);
-          reconnectTimeout = window.setTimeout(connect, 3000);
+          if (isUnmounted) return;
+          setConnectionState('RECONNECTING');
+          reconnectTimeout = window.setTimeout(connectWs, 3000);
         };
 
         ws.onerror = () => {
-          setIsConnected(false);
-          ws?.close();
+          if (isUnmounted) return;
+          setConnectionState('DISCONNECTED');
+          ws.close();
         };
       } catch {
-        setIsConnected(false);
-        reconnectTimeout = window.setTimeout(connect, 5000);
+        if (!isUnmounted) {
+          setConnectionState('DISCONNECTED');
+          reconnectTimeout = window.setTimeout(connectWs, 5000);
+        }
       }
     }
 
-    connect();
+    // Initial fetch + start WS
+    fetchStateFromBackend();
+    connectWs();
+
+    // 5-second polling recovery mechanism (as requested in Section 6)
+    pollTimerRef.current = window.setInterval(() => {
+      fetchStateFromBackend();
+    }, 5000);
 
     return () => {
+      isUnmounted = true;
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
-      ws?.close();
+      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+      if (wsRef.current) wsRef.current.close();
     };
-  }, [syncState, state.version]);
+  }, [fetchStateFromBackend]);
 
-  useEffect(() => {
-    if (!broadcastChannel) return;
-
-    const handleBroadcast = (event: MessageEvent) => {
-      if (event.data?.type === 'STATE_UPDATED' && event.data.payload) {
-        setState(event.data.payload);
-        try {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(event.data.payload));
-        } catch (e) {
-          console.error(e);
-        }
-      }
-    };
-
-    broadcastChannel.addEventListener('message', handleBroadcast);
-    return () => {
-      broadcastChannel.removeEventListener('message', handleBroadcast);
-    };
-  }, [broadcastChannel]);
-
+  // Derived Standings & Brackets
   const standings = useMemo(() => {
     return calculateStandings(state.matches, state.players, 'FASE_INICIAL');
   }, [state.matches, state.players]);
@@ -188,6 +219,7 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     return getBracketStructure(state.matches, state.players);
   }, [state.matches, state.players]);
 
+  // Confetti when champion is determined
   useEffect(() => {
     if (bracket.champion) {
       try {
@@ -202,6 +234,7 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     }
   }, [bracket.champion]);
 
+  // Active match helper
   const activeMatch = useMemo(() => {
     if (activeMatchId) {
       const found = state.matches.find(m => m.id === activeMatchId);
@@ -214,13 +247,16 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     return state.matches[0] || null;
   }, [activeMatchId, state.matches]);
 
+  // Selected player stats
   const selectedPlayerStats = useMemo(() => {
     if (!selectedPlayerStatsId) return null;
     return getPlayerStats(selectedPlayerStatsId, state.players, state.matches);
   }, [selectedPlayerStatsId, state.players, state.matches]);
 
+  // Admin PIN verification
   const unlockAdmin = useCallback((pin: string) => {
     if (pin === state.config.adminPin || pin === '1234') {
+      setAdminPin(pin);
       setIsAdminUnlocked(true);
       return true;
     }
@@ -231,439 +267,229 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     setIsAdminUnlocked(false);
   }, []);
 
+  // ==========================================
+  // BACKEND API MUTATION ACTIONS
+  // ==========================================
+
   const recordPoint = useCallback(
-    (matchId: string, winnerPlayerId: string) => {
-      const matchIndex = state.matches.findIndex(m => m.id === matchId);
-      if (matchIndex === -1) return;
-
-      const currentMatch = state.matches[matchIndex];
-      const updatedMatch = applyPoint(
-        currentMatch,
-        winnerPlayerId,
-        state.config.pointsToWin,
-        state.config.minimumWinningDifference
-      );
-
-      const newMatches = [...state.matches];
-      newMatches[matchIndex] = updatedMatch;
-
-      const recalculatedMatches = deriveBracketMatches(newMatches, state.players);
-
-      const newState: TournamentState = {
-        ...state,
-        matches: recalculatedMatches,
-        version: (state.version || 0) + 1,
-        lastUpdated: new Date().toISOString()
-      };
-
-      syncState(newState);
+    async (matchId: string, winnerPlayerId: string) => {
+      const data = await apiFetch(`/api/matches/${matchId}/point`, {
+        method: 'POST',
+        body: JSON.stringify({ winnerPlayerId })
+      });
+      if (data.success && data.data) {
+        setState(data.data);
+      }
     },
-    [state, syncState]
+    [apiFetch]
   );
 
   const undoPoint = useCallback(
-    (matchId: string) => {
-      const matchIndex = state.matches.findIndex(m => m.id === matchId);
-      if (matchIndex === -1) return;
-
-      const currentMatch = state.matches[matchIndex];
-      const updatedMatch = undoLastPoint(
-        currentMatch,
-        state.config.pointsToWin,
-        state.config.minimumWinningDifference
-      );
-
-      const newMatches = [...state.matches];
-      newMatches[matchIndex] = updatedMatch;
-
-      const recalculatedMatches = deriveBracketMatches(newMatches, state.players);
-
-      const newState: TournamentState = {
-        ...state,
-        matches: recalculatedMatches,
-        version: (state.version || 0) + 1,
-        lastUpdated: new Date().toISOString()
-      };
-
-      syncState(newState);
+    async (matchId: string) => {
+      const data = await apiFetch(`/api/matches/${matchId}/undo`, {
+        method: 'POST'
+      });
+      if (data.success && data.data) {
+        setState(data.data);
+      }
     },
-    [state, syncState]
+    [apiFetch]
   );
 
   const setPalSaqueServer = useCallback(
-    (matchId: string, serverId: string) => {
-      const matchIndex = state.matches.findIndex(m => m.id === matchId);
-      if (matchIndex === -1) return;
-
-      const currentMatch = state.matches[matchIndex];
-      const updatedMatch = setPalSaque(currentMatch, serverId);
-
-      const newMatches = [...state.matches];
-      newMatches[matchIndex] = updatedMatch;
-
-      const newState: TournamentState = {
-        ...state,
-        matches: newMatches,
-        version: (state.version || 0) + 1,
-        lastUpdated: new Date().toISOString()
-      };
-
-      syncState(newState);
+    async (matchId: string, serverId: string) => {
+      const data = await apiFetch(`/api/matches/${matchId}/palsaque`, {
+        method: 'POST',
+        body: JSON.stringify({ serverId })
+      });
+      if (data.success && data.data) {
+        setState(data.data);
+      }
     },
-    [state, syncState]
+    [apiFetch]
   );
 
   const startMatch = useCallback(
-    (matchId: string) => {
-      const matchIndex = state.matches.findIndex(m => m.id === matchId);
-      if (matchIndex === -1) return;
-
-      const currentMatch = state.matches[matchIndex];
-      if (!currentMatch.player1Id || !currentMatch.player2Id) return;
-
-      const serverId = currentMatch.initialServerId || currentMatch.player1Id;
-      const updatedMatch: Match = {
-        ...currentMatch,
-        status: 'EN_JUEGO',
-        initialServerId: serverId,
-        currentServerId: serverId,
-        updatedAt: new Date().toISOString()
-      };
-
-      const newMatches = [...state.matches];
-      newMatches[matchIndex] = updatedMatch;
-
-      const newState: TournamentState = {
-        ...state,
-        matches: newMatches,
-        version: (state.version || 0) + 1,
-        lastUpdated: new Date().toISOString()
-      };
-
-      setActiveMatchId(matchId);
-      syncState(newState);
+    async (matchId: string) => {
+      const data = await apiFetch(`/api/matches/${matchId}/start`, {
+        method: 'POST'
+      });
+      if (data.success && data.data) {
+        setState(data.data);
+        setActiveMatchId(matchId);
+      }
     },
-    [state, syncState]
+    [apiFetch]
   );
 
   const updateMatch = useCallback(
-    (matchId: string, partial: Partial<Match>) => {
-      const matchIndex = state.matches.findIndex(m => m.id === matchId);
-      if (matchIndex === -1) return;
-
-      const current = state.matches[matchIndex];
-      const updated: Match = {
-        ...current,
-        ...partial,
-        updatedAt: new Date().toISOString()
-      };
-
-      const newMatches = [...state.matches];
-      newMatches[matchIndex] = updated;
-
-      const recalculatedMatches = deriveBracketMatches(newMatches, state.players);
-
-      const newState: TournamentState = {
-        ...state,
-        matches: recalculatedMatches,
-        version: (state.version || 0) + 1,
-        lastUpdated: new Date().toISOString()
-      };
-
-      syncState(newState);
+    async (matchId: string, partial: Partial<Match>) => {
+      const data = await apiFetch(`/api/matches/${matchId}/schedule`, {
+        method: 'POST',
+        body: JSON.stringify(partial)
+      });
+      if (data.success && data.data) {
+        setState(data.data);
+      }
     },
-    [state, syncState]
+    [apiFetch]
   );
 
-  // Schedules and Calendar Modifications
   const updateMatchSchedule = useCallback(
-    (matchId: string, scheduledTime: string) => {
-      const matchIndex = state.matches.findIndex(m => m.id === matchId);
-      if (matchIndex === -1) return;
-
-      const newMatches = [...state.matches];
-      newMatches[matchIndex] = {
-        ...newMatches[matchIndex],
-        scheduledTime,
-        updatedAt: new Date().toISOString()
-      };
-
-      const newState: TournamentState = {
-        ...state,
-        matches: newMatches,
-        version: (state.version || 0) + 1,
-        lastUpdated: new Date().toISOString()
-      };
-
-      syncState(newState);
+    async (matchId: string, scheduledTime: string) => {
+      const data = await apiFetch(`/api/matches/${matchId}/schedule`, {
+        method: 'POST',
+        body: JSON.stringify({ scheduledTime })
+      });
+      if (data.success && data.data) {
+        setState(data.data);
+      }
     },
-    [state, syncState]
+    [apiFetch]
   );
 
   const updateMatchPairing = useCallback(
-    (matchId: string, player1Id: string, player2Id: string) => {
-      const matchIndex = state.matches.findIndex(m => m.id === matchId);
-      if (matchIndex === -1) return;
-
-      const current = state.matches[matchIndex];
-      const playersChanged = current.player1Id !== player1Id || current.player2Id !== player2Id;
-
-      const updated: Match = {
-        ...current,
-        player1Id,
-        player2Id,
-        score1: playersChanged ? 0 : current.score1,
-        score2: playersChanged ? 0 : current.score2,
-        status: playersChanged ? 'PENDIENTE' : current.status,
-        winnerId: playersChanged ? null : current.winnerId,
-        pointHistory: playersChanged ? [] : current.pointHistory,
-        updatedAt: new Date().toISOString()
-      };
-
-      const newMatches = [...state.matches];
-      newMatches[matchIndex] = updated;
-
-      const recalculatedMatches = deriveBracketMatches(newMatches, state.players);
-
-      const newState: TournamentState = {
-        ...state,
-        matches: recalculatedMatches,
-        version: (state.version || 0) + 1,
-        lastUpdated: new Date().toISOString()
-      };
-
-      syncState(newState);
+    async (matchId: string, player1Id: string, player2Id: string) => {
+      const data = await apiFetch(`/api/matches/${matchId}/schedule`, {
+        method: 'POST',
+        body: JSON.stringify({ player1Id, player2Id })
+      });
+      if (data.success && data.data) {
+        setState(data.data);
+      }
     },
-    [state, syncState]
+    [apiFetch]
   );
 
   const swapMatchOrder = useCallback(
-    (index1: number, index2: number) => {
-      if (index1 < 0 || index2 < 0 || index1 >= state.matches.length || index2 >= state.matches.length) return;
-
-      const newMatches = [...state.matches];
-      const temp = newMatches[index1];
-      newMatches[index1] = newMatches[index2];
-      newMatches[index2] = temp;
-
-      // Re-assign sequential match numbers and calculate times based on config
-      const updatedMatches = newMatches.map((m, idx) => ({
-        ...m,
-        matchNumber: idx + 1,
-        updatedAt: new Date().toISOString()
-      }));
-
-      const newState: TournamentState = {
-        ...state,
-        matches: updatedMatches,
-        version: (state.version || 0) + 1,
-        lastUpdated: new Date().toISOString()
-      };
-
-      syncState(newState);
+    async (index1: number, index2: number) => {
+      const data = await apiFetch(`/api/admin/schedule/reorder`, {
+        method: 'POST',
+        body: JSON.stringify({ index1, index2 })
+      });
+      if (data.success && data.data) {
+        setState(data.data);
+      }
     },
-    [state, syncState]
+    [apiFetch]
   );
 
   const recalculateAllSchedules = useCallback(
-    (startTime?: string, durationMinutes?: number) => {
-      const st = startTime || state.config.startTime;
-      const dur = durationMinutes || state.config.matchDurationMinutes;
-
-      const updatedMatches = recalculateAllMatchTimes(state.matches, st, dur);
-
-      const newState: TournamentState = {
-        ...state,
-        config: {
-          ...state.config,
-          startTime: st,
-          matchDurationMinutes: dur,
-          updatedAt: new Date().toISOString()
-        },
-        matches: updatedMatches,
-        version: (state.version || 0) + 1,
-        lastUpdated: new Date().toISOString()
-      };
-
-      syncState(newState);
+    async (startTime?: string, durationMinutes?: number) => {
+      const data = await apiFetch(`/api/admin/schedule/recalculate`, {
+        method: 'POST',
+        body: JSON.stringify({ startTime, durationMinutes })
+      });
+      if (data.success && data.data) {
+        setState(data.data);
+      }
     },
-    [state, syncState]
+    [apiFetch]
   );
 
   const shiftPendingSchedules = useCallback(
-    (minutesDelta: number) => {
-      const updatedMatches = shiftPendingMatchTimes(state.matches, minutesDelta);
-
-      const newState: TournamentState = {
-        ...state,
-        matches: updatedMatches,
-        version: (state.version || 0) + 1,
-        lastUpdated: new Date().toISOString()
-      };
-
-      syncState(newState);
+    async (minutesDelta: number) => {
+      const data = await apiFetch(`/api/admin/schedule/shift`, {
+        method: 'POST',
+        body: JSON.stringify({ minutesDelta })
+      });
+      if (data.success && data.data) {
+        setState(data.data);
+      }
     },
-    [state, syncState]
+    [apiFetch]
   );
 
-  const resetInitialScheduleToDefault = useCallback(() => {
-    const balancedInitial = generateBalancedInitialSchedule(
-      state.players.length === 10 ? state.players : INITIAL_PLAYERS,
-      state.config.startTime,
-      state.config.matchDurationMinutes,
-      state.config.id
-    );
-
-    const playoffMatches = state.matches.filter(m => m.phase !== 'FASE_INICIAL');
-    const allMatches = deriveBracketMatches([...balancedInitial, ...playoffMatches], state.players);
-
-    const newState: TournamentState = {
-      ...state,
-      matches: allMatches,
-      version: (state.version || 0) + 1,
-      lastUpdated: new Date().toISOString()
-    };
-
-    syncState(newState);
-  }, [state, syncState]);
+  const resetInitialScheduleToDefault = useCallback(
+    async () => {
+      const data = await apiFetch(`/api/admin/reset`, {
+        method: 'POST',
+        body: JSON.stringify({ preservePlayers: true })
+      });
+      if (data.success && data.data) {
+        setState(data.data);
+      }
+    },
+    [apiFetch]
+  );
 
   const updatePlayer = useCallback(
-    (player: Player) => {
-      const newPlayers = state.players.map(p => (p.id === player.id ? player : p));
-      const recalculatedMatches = deriveBracketMatches(state.matches, newPlayers);
-
-      const newState: TournamentState = {
-        ...state,
-        players: newPlayers,
-        matches: recalculatedMatches,
-        version: (state.version || 0) + 1,
-        lastUpdated: new Date().toISOString()
-      };
-
-      syncState(newState);
+    async (player: Player) => {
+      const data = await apiFetch(`/api/admin/players`, {
+        method: 'POST',
+        body: JSON.stringify({ action: 'update', player })
+      });
+      if (data.success && data.data) {
+        setState(data.data);
+      }
     },
-    [state, syncState]
+    [apiFetch]
   );
 
   const addPlayer = useCallback(
-    (playerData: Omit<Player, 'id' | 'createdAt'>) => {
-      const newPlayer: Player = {
-        ...playerData,
-        id: `player-${Date.now()}`,
-        createdAt: new Date().toISOString()
-      };
-      const newPlayers = [...state.players, newPlayer];
-      const recalculatedMatches = deriveBracketMatches(state.matches, newPlayers);
-
-      const newState: TournamentState = {
-        ...state,
-        players: newPlayers,
-        matches: recalculatedMatches,
-        version: (state.version || 0) + 1,
-        lastUpdated: new Date().toISOString()
-      };
-
-      syncState(newState);
+    async (playerData: Omit<Player, 'id' | 'createdAt'>) => {
+      const data = await apiFetch(`/api/admin/players`, {
+        method: 'POST',
+        body: JSON.stringify({ action: 'add', player: playerData })
+      });
+      if (data.success && data.data) {
+        setState(data.data);
+      }
     },
-    [state, syncState]
+    [apiFetch]
   );
 
   const deletePlayer = useCallback(
-    (playerId: string) => {
-      const newPlayers = state.players.filter(p => p.id !== playerId);
-      const recalculatedMatches = deriveBracketMatches(state.matches, newPlayers);
-
-      const newState: TournamentState = {
-        ...state,
-        players: newPlayers,
-        matches: recalculatedMatches,
-        version: (state.version || 0) + 1,
-        lastUpdated: new Date().toISOString()
-      };
-
-      syncState(newState);
+    async (playerId: string) => {
+      const data = await apiFetch(`/api/admin/players`, {
+        method: 'POST',
+        body: JSON.stringify({ action: 'delete', playerId })
+      });
+      if (data.success && data.data) {
+        setState(data.data);
+      }
     },
-    [state, syncState]
+    [apiFetch]
   );
 
   const updateConfig = useCallback(
-    (partialConfig: Partial<TournamentConfig>) => {
-      const newConfig: TournamentConfig = {
-        ...state.config,
-        ...partialConfig,
-        updatedAt: new Date().toISOString()
-      };
-
-      const newState: TournamentState = {
-        ...state,
-        config: newConfig,
-        version: (state.version || 0) + 1,
-        lastUpdated: new Date().toISOString()
-      };
-
-      syncState(newState);
+    async (partialConfig: Partial<TournamentConfig>) => {
+      const data = await apiFetch(`/api/admin/config`, {
+        method: 'POST',
+        body: JSON.stringify(partialConfig)
+      });
+      if (data.success && data.data) {
+        setState(data.data);
+      }
     },
-    [state, syncState]
+    [apiFetch]
   );
 
   const resetTournament = useCallback(
-    (preservePlayers: boolean = true) => {
-      const fresh = createInitialTournamentState();
-      const resetState: TournamentState = {
-        ...fresh,
-        players: preservePlayers ? state.players : fresh.players,
-        config: state.config,
-        version: (state.version || 0) + 1,
-        lastUpdated: new Date().toISOString()
-      };
-
-      syncState(resetState);
-      setActiveMatchId(null);
+    async (preservePlayers: boolean = true) => {
+      const data = await apiFetch(`/api/admin/reset`, {
+        method: 'POST',
+        body: JSON.stringify({ preservePlayers })
+      });
+      if (data.success && data.data) {
+        setState(data.data);
+        setActiveMatchId(null);
+      }
     },
-    [state.players, state.config, syncState]
+    [apiFetch]
   );
 
-  const populateDemoResults = useCallback(() => {
-    let currentMatches = [...state.matches];
-
-    currentMatches = currentMatches.map(m => {
-      if (m.phase === 'FASE_INICIAL' && m.player1Id && m.player2Id) {
-        const p1 = state.players.find(p => p.id === m.player1Id);
-        const p2 = state.players.find(p => p.id === m.player2Id);
-        
-        const levelScore = (level: string) => level === 'Muy bueno' ? 3 : (level === 'Nivel medio' ? 2 : 1);
-        const p1Strength = levelScore(p1?.level || '') + (m.matchNumber % 2 === 0 ? 0.5 : 0);
-        const p2Strength = levelScore(p2?.level || '');
-
-        const p1Wins = p1Strength >= p2Strength;
-        const score1 = p1Wins ? 11 : Math.floor(Math.random() * 4) + 6;
-        const score2 = p1Wins ? Math.floor(Math.random() * 4) + 6 : 11;
-
-        return {
-          ...m,
-          score1,
-          score2,
-          status: 'FINALIZADO',
-          winnerId: p1Wins ? m.player1Id : m.player2Id,
-          initialServerId: m.player1Id,
-          currentServerId: null,
-          updatedAt: new Date().toISOString()
-        };
+  const populateDemoResults = useCallback(
+    async () => {
+      const data = await apiFetch(`/api/admin/demo`, {
+        method: 'POST'
+      });
+      if (data.success && data.data) {
+        setState(data.data);
       }
-      return m;
-    });
-
-    currentMatches = deriveBracketMatches(currentMatches, state.players);
-
-    const newState: TournamentState = {
-      ...state,
-      matches: currentMatches,
-      version: (state.version || 0) + 1,
-      lastUpdated: new Date().toISOString()
-    };
-
-    syncState(newState);
-  }, [state, syncState]);
+    },
+    [apiFetch]
+  );
 
   return (
     <TournamentContext.Provider
@@ -677,8 +503,10 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         selectedPlayerStatsId,
         setSelectedPlayerStatsId,
         selectedPlayerStats,
-        isConnected,
+        connectionState,
+        isConnected: connectionState === 'CONNECTED',
         isAdminUnlocked,
+        adminPin,
         unlockAdmin,
         lockAdmin,
         recordPoint,

@@ -6,11 +6,9 @@ import {
   Calendar,
   BookOpen,
   Shield,
-  Activity,
   Lock,
   Unlock,
   Radio,
-  Wifi,
   Sparkles
 } from 'lucide-react';
 
@@ -20,7 +18,15 @@ interface NavbarProps {
 }
 
 export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab }) => {
-  const { isConnected, isAdminUnlocked, unlockAdmin, lockAdmin, state, populateDemoResults } = useTournament();
+  const {
+    connectionState,
+    isAdminUnlocked,
+    unlockAdmin,
+    lockAdmin,
+    state,
+    populateDemoResults
+  } = useTournament();
+
   const [showPinModal, setShowPinModal] = useState(false);
   const [pinInput, setPinInput] = useState('');
   const [pinError, setPinError] = useState(false);
@@ -78,7 +84,7 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab }) => {
                     10 Jugadores
                   </span>
                   <span>•</span>
-                  <span>11:00h</span>
+                  <span>{state.config.startTime}h</span>
                 </div>
               </div>
             </div>
@@ -132,7 +138,7 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab }) => {
 
             {/* Right Status Indicators */}
             <div className="flex items-center space-x-3">
-              {/* Quick Demo Simulator */}
+              {/* Quick Demo Simulator (Admin Only or Helper) */}
               <button
                 onClick={populateDemoResults}
                 title="Rellenar resultados de prueba automáticamente para comprobar todo el flujo"
@@ -142,22 +148,36 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab }) => {
                 <span>Simular Fase 1</span>
               </button>
 
-              {/* Realtime Connection Badge */}
+              {/* Realtime 3-State Connection Badge */}
               <div
-                className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-xs font-medium border ${
-                  isConnected
+                className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-xs font-bold border transition-colors ${
+                  connectionState === 'CONNECTED'
                     ? 'bg-emerald-950/60 text-emerald-400 border-emerald-800/60'
-                    : 'bg-amber-950/60 text-amber-400 border-amber-800/60'
+                    : connectionState === 'RECONNECTING'
+                    ? 'bg-amber-950/60 text-amber-400 border-amber-800/60'
+                    : 'bg-rose-950/60 text-rose-400 border-rose-800/60'
                 }`}
-                title={isConnected ? 'Sincronizado en tiempo real (WebSocket)' : 'Sincronizado localmente (BroadcastChannel / LocalStorage)'}
+                title={
+                  connectionState === 'CONNECTED'
+                    ? 'Conectado al servidor backend y WebSocket en tiempo real'
+                    : connectionState === 'RECONNECTING'
+                    ? 'Reconectando con el servidor backend...'
+                    : 'Sin conexión con el servidor backend'
+                }
               >
                 <span
                   className={`w-2 h-2 rounded-full ${
-                    isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
+                    connectionState === 'CONNECTED'
+                      ? 'bg-emerald-400 animate-pulse'
+                      : connectionState === 'RECONNECTING'
+                      ? 'bg-amber-400 animate-ping'
+                      : 'bg-rose-500'
                   }`}
                 />
-                <span className="hidden sm:inline">
-                  {isConnected ? 'En Vivo' : 'Sync Local'}
+                <span className="text-[11px]">
+                  {connectionState === 'CONNECTED' && '🟢 EN DIRECTO'}
+                  {connectionState === 'RECONNECTING' && '🟡 RECONECTANDO...'}
+                  {connectionState === 'DISCONNECTED' && '🔴 SIN CONEXIÓN'}
                 </span>
               </div>
 
