@@ -7,11 +7,16 @@ import {
   StandingRow,
   PlayerStats
 } from '../types/tournament';
-import { createInitialTournamentState } from '../data/initialData';
+import { createInitialTournamentState, INITIAL_PLAYERS } from '../data/initialData';
 import { applyPoint, undoLastPoint, setPalSaque } from '../core/rules';
 import { calculateStandings } from '../core/standings';
 import { deriveBracketMatches, getBracketStructure, BracketData } from '../core/bracket';
 import { getPlayerStats } from '../core/stats';
+import {
+  generateBalancedInitialSchedule,
+  recalculateAllMatchTimes,
+  shiftPendingMatchTimes
+} from '../core/schedule';
 import confetti from 'canvas-confetti';
 
 interface TournamentContextType {
@@ -28,12 +33,20 @@ interface TournamentContextType {
   isAdminUnlocked: boolean;
   unlockAdmin: (pin: string) => boolean;
   lockAdmin: () => void;
-  // Core actions
+  // Core scoring & tournament actions
   recordPoint: (matchId: string, winnerPlayerId: string) => void;
   undoPoint: (matchId: string) => void;
   setPalSaqueServer: (matchId: string, serverId: string) => void;
   startMatch: (matchId: string) => void;
   updateMatch: (matchId: string, partial: Partial<Match>) => void;
+  // Schedule & Calendar management actions
+  updateMatchSchedule: (matchId: string, scheduledTime: string) => void;
+  updateMatchPairing: (matchId: string, player1Id: string, player2Id: string) => void;
+  swapMatchOrder: (index1: number, index2: number) => void;
+  recalculateAllSchedules: (startTime?: string, durationMinutes?: number) => void;
+  shiftPendingSchedules: (minutesDelta: number) => void;
+  resetInitialScheduleToDefault: () => void;
+  // Players & config actions
   updatePlayer: (player: Player) => void;
   addPlayer: (player: Omit<Player, 'id' | 'createdAt'>) => void;
   deletePlayer: (playerId: string) => void;
@@ -48,7 +61,6 @@ const BROADCAST_CHANNEL_NAME = 'pingpong_realtime_channel';
 const TournamentContext = createContext<TournamentContextType | null>(null);
 
 export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  // Initialize state from localStorage or default initial data
   const [state, setState] = useState<TournamentState>(() => {
     try {
       const local = localStorage.getItem(STORAGE_KEY);
@@ -66,7 +78,6 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const [isConnected, setIsConnected] = useState(false);
   const [isAdminUnlocked, setIsAdminUnlocked] = useState(false);
 
-  // Broadcast Channel for multi-tab instant sync
   const broadcastChannel = useMemo(() => {
     try {
       if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
@@ -78,7 +89,6 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     return null;
   }, []);
 
-  // Save to localStorage & notify peers
   const syncState = useCallback(
     (newState: TournamentState, notifyNetwork = true) => {
       setState(newState);
@@ -92,20 +102,16 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         if (broadcastChannel) {
           broadcastChannel.postMessage({ type: 'STATE_UPDATED', payload: newState });
         }
-        // Send to backend API if available
         fetch('http://localhost:3001/api/tournament/sync', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(newState)
-        }).catch(() => {
-          // Backend server might not be running in static mode, which is fine
-        });
+        }).catch(() => {});
       }
     },
     [broadcastChannel]
   );
 
-  // Setup WebSocket connection to backend server
   useEffect(() => {
     let ws: WebSocket | null = null;
     let reconnectTimeout: number | undefined;
@@ -116,7 +122,6 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
 
         ws.onopen = () => {
           setIsConnected(true);
-          console.log('📡 Connected to WebSocket server');
         };
 
         ws.onmessage = (event) => {
@@ -155,7 +160,6 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     };
   }, [syncState, state.version]);
 
-  // Listen to BroadcastChannel messages from other tabs
   useEffect(() => {
     if (!broadcastChannel) return;
 
@@ -176,17 +180,14 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     };
   }, [broadcastChannel]);
 
-  // Derived Standings
   const standings = useMemo(() => {
     return calculateStandings(state.matches, state.players, 'FASE_INICIAL');
   }, [state.matches, state.players]);
 
-  // Derived Bracket Structure
   const bracket = useMemo(() => {
     return getBracketStructure(state.matches, state.players);
   }, [state.matches, state.players]);
 
-  // Celebrate champion with confetti
   useEffect(() => {
     if (bracket.champion) {
       try {
@@ -201,13 +202,11 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     }
   }, [bracket.champion]);
 
-  // Current active match
   const activeMatch = useMemo(() => {
     if (activeMatchId) {
       const found = state.matches.find(m => m.id === activeMatchId);
       if (found) return found;
     }
-    // Default to first match in game, or first pending match
     const inGame = state.matches.find(m => m.status === 'EN_JUEGO');
     if (inGame) return inGame;
     const pending = state.matches.find(m => m.status === 'PENDIENTE' && m.player1Id && m.player2Id);
@@ -215,13 +214,11 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     return state.matches[0] || null;
   }, [activeMatchId, state.matches]);
 
-  // Selected player stats
   const selectedPlayerStats = useMemo(() => {
     if (!selectedPlayerStatsId) return null;
     return getPlayerStats(selectedPlayerStatsId, state.players, state.matches);
   }, [selectedPlayerStatsId, state.players, state.matches]);
 
-  // Admin PIN Unlock
   const unlockAdmin = useCallback((pin: string) => {
     if (pin === state.config.adminPin || pin === '1234') {
       setIsAdminUnlocked(true);
@@ -234,7 +231,6 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     setIsAdminUnlocked(false);
   }, []);
 
-  // Action: Record point
   const recordPoint = useCallback(
     (matchId: string, winnerPlayerId: string) => {
       const matchIndex = state.matches.findIndex(m => m.id === matchId);
@@ -251,7 +247,6 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       const newMatches = [...state.matches];
       newMatches[matchIndex] = updatedMatch;
 
-      // Automatically recalculate and derive playoff & consolation brackets
       const recalculatedMatches = deriveBracketMatches(newMatches, state.players);
 
       const newState: TournamentState = {
@@ -266,7 +261,6 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     [state, syncState]
   );
 
-  // Action: Undo point
   const undoPoint = useCallback(
     (matchId: string) => {
       const matchIndex = state.matches.findIndex(m => m.id === matchId);
@@ -296,7 +290,6 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     [state, syncState]
   );
 
-  // Action: Set Pal Saque server
   const setPalSaqueServer = useCallback(
     (matchId: string, serverId: string) => {
       const matchIndex = state.matches.findIndex(m => m.id === matchId);
@@ -320,7 +313,6 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     [state, syncState]
   );
 
-  // Action: Start match
   const startMatch = useCallback(
     (matchId: string) => {
       const matchIndex = state.matches.findIndex(m => m.id === matchId);
@@ -354,7 +346,6 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     [state, syncState]
   );
 
-  // Action: Update match manually
   const updateMatch = useCallback(
     (matchId: string, partial: Partial<Match>) => {
       const matchIndex = state.matches.findIndex(m => m.id === matchId);
@@ -384,7 +375,158 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     [state, syncState]
   );
 
-  // Action: Update player
+  // Schedules and Calendar Modifications
+  const updateMatchSchedule = useCallback(
+    (matchId: string, scheduledTime: string) => {
+      const matchIndex = state.matches.findIndex(m => m.id === matchId);
+      if (matchIndex === -1) return;
+
+      const newMatches = [...state.matches];
+      newMatches[matchIndex] = {
+        ...newMatches[matchIndex],
+        scheduledTime,
+        updatedAt: new Date().toISOString()
+      };
+
+      const newState: TournamentState = {
+        ...state,
+        matches: newMatches,
+        version: (state.version || 0) + 1,
+        lastUpdated: new Date().toISOString()
+      };
+
+      syncState(newState);
+    },
+    [state, syncState]
+  );
+
+  const updateMatchPairing = useCallback(
+    (matchId: string, player1Id: string, player2Id: string) => {
+      const matchIndex = state.matches.findIndex(m => m.id === matchId);
+      if (matchIndex === -1) return;
+
+      const current = state.matches[matchIndex];
+      const playersChanged = current.player1Id !== player1Id || current.player2Id !== player2Id;
+
+      const updated: Match = {
+        ...current,
+        player1Id,
+        player2Id,
+        score1: playersChanged ? 0 : current.score1,
+        score2: playersChanged ? 0 : current.score2,
+        status: playersChanged ? 'PENDIENTE' : current.status,
+        winnerId: playersChanged ? null : current.winnerId,
+        pointHistory: playersChanged ? [] : current.pointHistory,
+        updatedAt: new Date().toISOString()
+      };
+
+      const newMatches = [...state.matches];
+      newMatches[matchIndex] = updated;
+
+      const recalculatedMatches = deriveBracketMatches(newMatches, state.players);
+
+      const newState: TournamentState = {
+        ...state,
+        matches: recalculatedMatches,
+        version: (state.version || 0) + 1,
+        lastUpdated: new Date().toISOString()
+      };
+
+      syncState(newState);
+    },
+    [state, syncState]
+  );
+
+  const swapMatchOrder = useCallback(
+    (index1: number, index2: number) => {
+      if (index1 < 0 || index2 < 0 || index1 >= state.matches.length || index2 >= state.matches.length) return;
+
+      const newMatches = [...state.matches];
+      const temp = newMatches[index1];
+      newMatches[index1] = newMatches[index2];
+      newMatches[index2] = temp;
+
+      // Re-assign sequential match numbers and calculate times based on config
+      const updatedMatches = newMatches.map((m, idx) => ({
+        ...m,
+        matchNumber: idx + 1,
+        updatedAt: new Date().toISOString()
+      }));
+
+      const newState: TournamentState = {
+        ...state,
+        matches: updatedMatches,
+        version: (state.version || 0) + 1,
+        lastUpdated: new Date().toISOString()
+      };
+
+      syncState(newState);
+    },
+    [state, syncState]
+  );
+
+  const recalculateAllSchedules = useCallback(
+    (startTime?: string, durationMinutes?: number) => {
+      const st = startTime || state.config.startTime;
+      const dur = durationMinutes || state.config.matchDurationMinutes;
+
+      const updatedMatches = recalculateAllMatchTimes(state.matches, st, dur);
+
+      const newState: TournamentState = {
+        ...state,
+        config: {
+          ...state.config,
+          startTime: st,
+          matchDurationMinutes: dur,
+          updatedAt: new Date().toISOString()
+        },
+        matches: updatedMatches,
+        version: (state.version || 0) + 1,
+        lastUpdated: new Date().toISOString()
+      };
+
+      syncState(newState);
+    },
+    [state, syncState]
+  );
+
+  const shiftPendingSchedules = useCallback(
+    (minutesDelta: number) => {
+      const updatedMatches = shiftPendingMatchTimes(state.matches, minutesDelta);
+
+      const newState: TournamentState = {
+        ...state,
+        matches: updatedMatches,
+        version: (state.version || 0) + 1,
+        lastUpdated: new Date().toISOString()
+      };
+
+      syncState(newState);
+    },
+    [state, syncState]
+  );
+
+  const resetInitialScheduleToDefault = useCallback(() => {
+    const balancedInitial = generateBalancedInitialSchedule(
+      state.players.length === 10 ? state.players : INITIAL_PLAYERS,
+      state.config.startTime,
+      state.config.matchDurationMinutes,
+      state.config.id
+    );
+
+    const playoffMatches = state.matches.filter(m => m.phase !== 'FASE_INICIAL');
+    const allMatches = deriveBracketMatches([...balancedInitial, ...playoffMatches], state.players);
+
+    const newState: TournamentState = {
+      ...state,
+      matches: allMatches,
+      version: (state.version || 0) + 1,
+      lastUpdated: new Date().toISOString()
+    };
+
+    syncState(newState);
+  }, [state, syncState]);
+
   const updatePlayer = useCallback(
     (player: Player) => {
       const newPlayers = state.players.map(p => (p.id === player.id ? player : p));
@@ -403,7 +545,6 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     [state, syncState]
   );
 
-  // Action: Add player
   const addPlayer = useCallback(
     (playerData: Omit<Player, 'id' | 'createdAt'>) => {
       const newPlayer: Player = {
@@ -427,7 +568,6 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     [state, syncState]
   );
 
-  // Action: Delete player
   const deletePlayer = useCallback(
     (playerId: string) => {
       const newPlayers = state.players.filter(p => p.id !== playerId);
@@ -446,7 +586,6 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     [state, syncState]
   );
 
-  // Action: Update Config
   const updateConfig = useCallback(
     (partialConfig: Partial<TournamentConfig>) => {
       const newConfig: TournamentConfig = {
@@ -467,7 +606,6 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     [state, syncState]
   );
 
-  // Action: Reset Tournament
   const resetTournament = useCallback(
     (preservePlayers: boolean = true) => {
       const fresh = createInitialTournamentState();
@@ -485,18 +623,14 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     [state.players, state.config, syncState]
   );
 
-  // Action: Populate Demo Results for Quick Testing / Demonstration
   const populateDemoResults = useCallback(() => {
     let currentMatches = [...state.matches];
 
-    // Simular resultados realistas para los 10 partidos iniciales
-    // Generar marcadores acordes al nivel de cada jugador
     currentMatches = currentMatches.map(m => {
       if (m.phase === 'FASE_INICIAL' && m.player1Id && m.player2Id) {
         const p1 = state.players.find(p => p.id === m.player1Id);
         const p2 = state.players.find(p => p.id === m.player2Id);
         
-        // Determinar probabilidad de victoria según nivel
         const levelScore = (level: string) => level === 'Muy bueno' ? 3 : (level === 'Nivel medio' ? 2 : 1);
         const p1Strength = levelScore(p1?.level || '') + (m.matchNumber % 2 === 0 ? 0.5 : 0);
         const p2Strength = levelScore(p2?.level || '');
@@ -519,7 +653,6 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       return m;
     });
 
-    // Derivar cuadros con estos resultados
     currentMatches = deriveBracketMatches(currentMatches, state.players);
 
     const newState: TournamentState = {
@@ -553,6 +686,12 @@ export const TournamentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         setPalSaqueServer,
         startMatch,
         updateMatch,
+        updateMatchSchedule,
+        updateMatchPairing,
+        swapMatchOrder,
+        recalculateAllSchedules,
+        shiftPendingSchedules,
+        resetInitialScheduleToDefault,
         updatePlayer,
         addPlayer,
         deletePlayer,

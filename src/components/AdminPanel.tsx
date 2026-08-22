@@ -1,13 +1,12 @@
 import React, { useState } from 'react';
 import { useTournament } from '../context/TournamentContext';
 import { Player, PlayerLevel, Match } from '../types/tournament';
-import { isMatchFinished } from '../core/rules';
+import { validateInitialSchedule } from '../core/schedule';
 import {
   Shield,
   Users,
   Calendar,
   Settings,
-  Dices,
   RotateCcw,
   Plus,
   Trash2,
@@ -17,8 +16,15 @@ import {
   Sparkles,
   Radio,
   Clock,
-  Trophy,
-  Save
+  Save,
+  ArrowUpDown,
+  ChevronUp,
+  ChevronDown,
+  RefreshCw,
+  FastForward,
+  CheckCircle2,
+  XCircle,
+  HelpCircle
 } from 'lucide-react';
 
 export const AdminPanel: React.FC = () => {
@@ -30,6 +36,12 @@ export const AdminPanel: React.FC = () => {
     undoPoint,
     setPalSaqueServer,
     updateMatch,
+    updateMatchSchedule,
+    updateMatchPairing,
+    swapMatchOrder,
+    recalculateAllSchedules,
+    shiftPendingSchedules,
+    resetInitialScheduleToDefault,
     updatePlayer,
     addPlayer,
     deletePlayer,
@@ -39,16 +51,24 @@ export const AdminPanel: React.FC = () => {
   } = useTournament();
 
   const [activeAdminTab, setActiveAdminTab] = useState<
-    'scoreboard' | 'players' | 'matches' | 'config' | 'tools'
-  >('scoreboard');
+    'schedule' | 'scoreboard' | 'players' | 'config' | 'tools'
+  >('schedule');
 
   // Player Editing State
   const [editingPlayer, setEditingPlayer] = useState<Player | null>(null);
   const [newPlayerName, setNewPlayerName] = useState('');
   const [newPlayerLevel, setNewPlayerLevel] = useState<PlayerLevel>('Nivel medio');
 
-  // Match Editing State
-  const [editingMatch, setEditingMatch] = useState<Match | null>(null);
+  // Match Schedule & Pairing Editing State
+  const [editingMatchId, setEditingMatchId] = useState<string | null>(null);
+  const [editMatchTime, setEditMatchTime] = useState<string>('');
+  const [editMatchP1, setEditMatchP1] = useState<string>('');
+  const [editMatchP2, setEditMatchP2] = useState<string>('');
+  const [scheduleFilterPhase, setScheduleFilterPhase] = useState<string>('ALL');
+
+  // Schedule Global Configuration Inputs
+  const [globalStartTime, setGlobalStartTime] = useState<string>(state.config.startTime);
+  const [globalDuration, setGlobalDuration] = useState<number>(state.config.matchDurationMinutes);
 
   // Config State
   const [configName, setConfigName] = useState(state.config.name);
@@ -65,8 +85,15 @@ export const AdminPanel: React.FC = () => {
     setTimeout(() => setStatusMessage(null), 3000);
   };
 
+  const scheduleValidation = validateInitialSchedule(state.matches, state.players);
+
   const p1 = activeMatch ? state.players.find((p) => p.id === activeMatch.player1Id) : null;
   const p2 = activeMatch ? state.players.find((p) => p.id === activeMatch.player2Id) : null;
+
+  const filteredAdminMatches = state.matches.filter((m) => {
+    if (scheduleFilterPhase === 'ALL') return true;
+    return m.phase === scheduleFilterPhase;
+  });
 
   return (
     <div className="space-y-6 max-w-6xl mx-auto">
@@ -81,7 +108,7 @@ export const AdminPanel: React.FC = () => {
               <span>Panel de Control de Administración</span>
             </h2>
             <p className="text-xs sm:text-sm text-slate-400">
-              Gestión en vivo de marcador, jugadores, calendario y configuración
+              Modificación de horarios, calendario, jugadores y configuración
             </p>
           </div>
         </div>
@@ -97,11 +124,11 @@ export const AdminPanel: React.FC = () => {
       {/* Admin Tabs */}
       <div className="flex items-center space-x-2 overflow-x-auto pb-2">
         {[
-          { id: 'scoreboard', label: 'Marcador en Directo', icon: Radio },
-          { id: 'players', label: 'Jugadores (10)', icon: Users },
-          { id: 'matches', label: 'Partidos & Cruces', icon: Calendar },
-          { id: 'config', label: 'Configuración', icon: Settings },
-          { id: 'tools', label: 'Simulador & Reinicio', icon: Sparkles }
+          { id: 'schedule', label: '📅 Horarios & Calendario', icon: Calendar },
+          { id: 'scoreboard', label: '🏓 Marcador en Directo', icon: Radio },
+          { id: 'players', label: '👥 Jugadores (10)', icon: Users },
+          { id: 'config', label: '⚙️ Configuración', icon: Settings },
+          { id: 'tools', label: '✨ Simulador & Reset', icon: Sparkles }
         ].map((tab) => {
           const Icon = tab.icon;
           const isActive = activeAdminTab === tab.id;
@@ -123,10 +150,399 @@ export const AdminPanel: React.FC = () => {
         })}
       </div>
 
-      {/* Tab 1: Live Scoreboard Controller */}
+      {/* Tab 1: Horarios & Calendario (Featured!) */}
+      {activeAdminTab === 'schedule' && (
+        <div className="space-y-6">
+          {/* Global Schedule Tools Card */}
+          <div className="p-6 rounded-3xl bg-slate-900 border border-slate-800 space-y-6 shadow-xl">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-800 pb-4">
+              <div>
+                <h3 className="text-lg sm:text-xl font-bold text-white flex items-center space-x-2">
+                  <Calendar className="w-5 h-5 text-amber-400" />
+                  <span>Ajustes Globales de Horarios</span>
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Modifica la hora de inicio del torneo y los intervalos de duración de los partidos
+                </p>
+              </div>
+
+              {/* Quick Shift Pending Matches (+5m, +10m, -5m) */}
+              <div className="flex items-center space-x-1.5 bg-slate-950 p-1.5 rounded-2xl border border-slate-800">
+                <span className="text-[11px] font-bold text-slate-400 px-2 flex items-center space-x-1">
+                  <FastForward className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Desplazar pendientes:</span>
+                </span>
+                <button
+                  onClick={() => {
+                    shiftPendingSchedules(5);
+                    showFeedback('Horarios pendientes retrasados +5 min');
+                  }}
+                  className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-300 text-xs font-bold transition-colors"
+                >
+                  +5m
+                </button>
+                <button
+                  onClick={() => {
+                    shiftPendingSchedules(10);
+                    showFeedback('Horarios pendientes retrasados +10 min');
+                  }}
+                  className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-300 text-xs font-bold transition-colors"
+                >
+                  +10m
+                </button>
+                <button
+                  onClick={() => {
+                    shiftPendingSchedules(-5);
+                    showFeedback('Horarios pendientes adelantados -5 min');
+                  }}
+                  className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold transition-colors"
+                >
+                  -5m
+                </button>
+              </div>
+            </div>
+
+            {/* Recalculate Start Time & Duration Form */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 items-end bg-slate-950/60 p-4 rounded-2xl border border-slate-800/80">
+              <div className="space-y-1.5">
+                <label className="block text-xs font-semibold text-slate-400">
+                  Hora de Inicio General (Primer partido)
+                </label>
+                <input
+                  type="time"
+                  value={globalStartTime}
+                  onChange={(e) => setGlobalStartTime(e.target.value)}
+                  className="w-full px-3.5 py-2 bg-slate-900 border border-slate-700 rounded-xl text-white font-bold text-sm focus:outline-none focus:border-amber-500"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="block text-xs font-semibold text-slate-400">
+                  Duración Prevista por Partido (minutos)
+                </label>
+                <input
+                  type="number"
+                  min="5"
+                  max="60"
+                  value={globalDuration}
+                  onChange={(e) => setGlobalDuration(parseInt(e.target.value, 10) || 10)}
+                  className="w-full px-3.5 py-2 bg-slate-900 border border-slate-700 rounded-xl text-white font-bold text-sm focus:outline-none focus:border-amber-500"
+                />
+              </div>
+
+              <button
+                onClick={() => {
+                  recalculateAllSchedules(globalStartTime, globalDuration);
+                  showFeedback('Todos los horarios han sido recalculados');
+                }}
+                className="w-full py-2.5 px-4 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold text-xs sm:text-sm flex items-center justify-center space-x-2 shadow-lg shadow-amber-500/20 transition-all active:scale-95"
+              >
+                <RefreshCw className="w-4 h-4" />
+                <span>Recalcular Todos los Horarios</span>
+              </button>
+            </div>
+
+            {/* Live Schedule Integrity Banner */}
+            <div
+              className={`p-4 rounded-2xl border flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                scheduleValidation.isValid
+                  ? 'bg-emerald-950/30 border-emerald-500/30 text-emerald-300'
+                  : 'bg-rose-950/40 border-rose-500/40 text-rose-300'
+              }`}
+            >
+              <div className="flex items-center space-x-3">
+                {scheduleValidation.isValid ? (
+                  <CheckCircle2 className="w-6 h-6 text-emerald-400 shrink-0" />
+                ) : (
+                  <XCircle className="w-6 h-6 text-rose-400 shrink-0" />
+                )}
+                <div>
+                  <div className="font-bold text-sm text-white">
+                    {scheduleValidation.isValid
+                      ? '✓ Calendario de Fase Inicial Válido'
+                      : '⚠️ Advertencia en el Calendario de la Fase Inicial'}
+                  </div>
+                  <div className="text-xs text-slate-300">
+                    {scheduleValidation.isValid ? (
+                      <span>
+                        10 partidos programados • 10 participantes • Cada jugador disputa exactamente 2 partidos
+                      </span>
+                    ) : (
+                      <span>{scheduleValidation.errors.join(' • ')}</span>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <button
+                onClick={() => {
+                  resetInitialScheduleToDefault();
+                  showFeedback('Calendario equilibrado por defecto restaurado');
+                }}
+                className="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-xs font-bold text-slate-300 border border-slate-700 whitespace-nowrap transition-colors"
+              >
+                Restablecer Calendario Equilibrado
+              </button>
+            </div>
+          </div>
+
+          {/* Match-by-Match Interactive Schedule & Pairing Editor */}
+          <div className="p-6 rounded-3xl bg-slate-900 border border-slate-800 space-y-6 shadow-xl">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h3 className="text-lg sm:text-xl font-bold text-white">
+                  Edición Individual de Partidos, Horas y Jugadores
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Modifica la hora exacta o los contrincantes de cualquier partido del torneo
+                </p>
+              </div>
+
+              {/* Phase Filter */}
+              <div className="flex items-center space-x-1.5 overflow-x-auto">
+                {[
+                  { id: 'ALL', label: 'Todos' },
+                  { id: 'FASE_INICIAL', label: 'Fase Inicial (1-10)' },
+                  { id: 'CUARTOS', label: 'Cuartos' },
+                  { id: 'SEMIFINAL', label: 'Semifinales' },
+                  { id: 'FINAL', label: 'Final & 3º' },
+                  { id: 'CONSOLACION', label: 'Consolación' }
+                ].map((f) => (
+                  <button
+                    key={f.id}
+                    onClick={() => setScheduleFilterPhase(f.id)}
+                    className={`px-3 py-1 rounded-xl text-xs font-semibold whitespace-nowrap transition-colors ${
+                      scheduleFilterPhase === f.id
+                        ? 'bg-amber-500 text-slate-950 font-bold'
+                        : 'bg-slate-950 text-slate-400 hover:text-white border border-slate-800'
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Matches List */}
+            <div className="space-y-3">
+              {filteredAdminMatches.map((m, index) => {
+                const isEditing = editingMatchId === m.id;
+                const p1Obj = state.players.find((p) => p.id === m.player1Id);
+                const p2Obj = state.players.find((p) => p.id === m.player2Id);
+                const isInitial = m.phase === 'FASE_INICIAL';
+
+                return (
+                  <div
+                    key={m.id}
+                    className={`p-4 sm:p-5 rounded-2xl border transition-all ${
+                      isEditing
+                        ? 'bg-slate-950 border-amber-500/60 ring-2 ring-amber-500/20'
+                        : 'bg-slate-950/60 border-slate-800 hover:border-slate-700'
+                    }`}
+                  >
+                    {isEditing ? (
+                      /* Active Match Edit Form */
+                      <div className="space-y-4">
+                        <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                          <span className="font-extrabold text-amber-400 text-sm">
+                            Editando Partido #{m.matchNumber} ({m.phase.replace('_', ' ')})
+                          </span>
+                          <span className="text-xs text-slate-400">Estado: {m.status}</span>
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                          {/* Scheduled Time Input */}
+                          <div className="space-y-1">
+                            <label className="block text-xs font-semibold text-slate-400">
+                              Hora del Partido
+                            </label>
+                            <input
+                              type="time"
+                              value={editMatchTime}
+                              onChange={(e) => setEditMatchTime(e.target.value)}
+                              className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-xl text-white font-bold text-sm focus:outline-none focus:border-amber-500"
+                            />
+                          </div>
+
+                          {/* Player 1 Selector (Only for Initial Phase or Playoffs) */}
+                          <div className="space-y-1">
+                            <label className="block text-xs font-semibold text-slate-400">
+                              Jugador 1 {isInitial ? '' : '(o fuente)'}
+                            </label>
+                            {isInitial ? (
+                              <select
+                                value={editMatchP1}
+                                onChange={(e) => setEditMatchP1(e.target.value)}
+                                className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-xl text-white font-bold text-xs sm:text-sm focus:outline-none focus:border-amber-500"
+                              >
+                                <option value="">-- Seleccionar --</option>
+                                {state.players.map((p) => (
+                                  <option key={p.id} value={p.id}>
+                                    {p.name} ({p.level})
+                                  </option>
+                                ))}
+                              </select>
+                            ) : (
+                              <div className="px-3 py-2 bg-slate-900/60 rounded-xl border border-slate-800 text-xs text-slate-300">
+                                {p1Obj ? p1Obj.name : m.sourceDesc1 || 'Por clasificar'}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Player 2 Selector */}
+                          <div className="space-y-1">
+                            <label className="block text-xs font-semibold text-slate-400">
+                              Jugador 2 {isInitial ? '' : '(o fuente)'}
+                            </label>
+                            {isInitial ? (
+                              <select
+                                value={editMatchP2}
+                                onChange={(e) => setEditMatchP2(e.target.value)}
+                                className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-xl text-white font-bold text-xs sm:text-sm focus:outline-none focus:border-amber-500"
+                              >
+                                <option value="">-- Seleccionar --</option>
+                                {state.players.map((p) => (
+                                  <option key={p.id} value={p.id}>
+                                    {p.name} ({p.level})
+                                  </option>
+                                ))}
+                              </select>
+                            ) : (
+                              <div className="px-3 py-2 bg-slate-900/60 rounded-xl border border-slate-800 text-xs text-slate-300">
+                                {p2Obj ? p2Obj.name : m.sourceDesc2 || 'Por clasificar'}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Action buttons */}
+                        <div className="flex items-center justify-end space-x-2 pt-2">
+                          <button
+                            onClick={() => setEditingMatchId(null)}
+                            className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold"
+                          >
+                            Cancelar
+                          </button>
+
+                          {isInitial && (
+                            <button
+                              onClick={() => {
+                                const temp = editMatchP1;
+                                setEditMatchP1(editMatchP2);
+                                setEditMatchP2(temp);
+                              }}
+                              className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-400 text-xs font-bold flex items-center space-x-1"
+                            >
+                              <ArrowUpDown className="w-3.5 h-3.5" />
+                              <span>Invertir Lados</span>
+                            </button>
+                          )}
+
+                          <button
+                            onClick={() => {
+                              updateMatchSchedule(m.id, editMatchTime);
+                              if (isInitial && editMatchP1 && editMatchP2) {
+                                updateMatchPairing(m.id, editMatchP1, editMatchP2);
+                              }
+                              setEditingMatchId(null);
+                              showFeedback(`Partido #${m.matchNumber} actualizado`);
+                            }}
+                            className="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-md"
+                          >
+                            Guardar Cambios
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      /* Display Row */
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <div className="flex items-center space-x-3">
+                          {/* Order Reorder Controls */}
+                          {isInitial && (
+                            <div className="flex flex-col space-y-0.5">
+                              <button
+                                disabled={index === 0}
+                                onClick={() => swapMatchOrder(index, index - 1)}
+                                className="p-1 rounded bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white disabled:opacity-20"
+                                title="Subir orden del partido"
+                              >
+                                <ChevronUp className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                disabled={index === filteredAdminMatches.length - 1}
+                                onClick={() => swapMatchOrder(index, index + 1)}
+                                className="p-1 rounded bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white disabled:opacity-20"
+                                title="Bajar orden del partido"
+                              >
+                                <ChevronDown className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          )}
+
+                          <div className="w-9 h-9 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-center font-extrabold text-amber-400 text-sm">
+                            #{m.matchNumber}
+                          </div>
+
+                          <div>
+                            <div className="text-sm font-bold text-white flex items-center space-x-2">
+                              <span>
+                                {p1Obj ? p1Obj.name : m.sourceDesc1 || 'Por clasificar'}
+                              </span>
+                              <span className="text-slate-500 font-normal">vs</span>
+                              <span>
+                                {p2Obj ? p2Obj.name : m.sourceDesc2 || 'Por clasificar'}
+                              </span>
+                            </div>
+                            <div className="text-xs text-slate-400 flex items-center space-x-2 mt-0.5">
+                              <span className="font-semibold text-emerald-400 flex items-center space-x-1">
+                                <Clock className="w-3 h-3" />
+                                <span>{m.scheduledTime}h</span>
+                              </span>
+                              <span>•</span>
+                              <span>{m.phase.replace('_', ' ')}</span>
+                              {m.bracketCode && <span>({m.bracketCode})</span>}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Right Action buttons */}
+                        <div className="flex items-center space-x-2">
+                          <button
+                            onClick={() => {
+                              setEditingMatchId(m.id);
+                              setEditMatchTime(m.scheduledTime);
+                              setEditMatchP1(m.player1Id || '');
+                              setEditMatchP2(m.player2Id || '');
+                            }}
+                            className="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold flex items-center space-x-1.5 transition-colors border border-slate-700"
+                          >
+                            <Edit2 className="w-3.5 h-3.5 text-amber-400" />
+                            <span>Modificar Horario / Rival</span>
+                          </button>
+
+                          <button
+                            onClick={() => {
+                              setActiveMatchId(m.id);
+                              setActiveAdminTab('scoreboard');
+                            }}
+                            className="px-3.5 py-1.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-xs font-bold transition-colors"
+                          >
+                            Marcador en Vivo
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Tab 2: Live Scoreboard Controller */}
       {activeAdminTab === 'scoreboard' && (
         <div className="space-y-6">
-          {/* Match selector bar */}
           <div className="p-4 rounded-2xl bg-slate-900 border border-slate-800 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center space-x-2 text-xs sm:text-sm font-semibold text-slate-300">
               <span>Partido Activo en Marcador:</span>
@@ -169,7 +585,6 @@ export const AdminPanel: React.FC = () => {
             )}
           </div>
 
-          {/* Big Live Tablet Touch Scoring Card */}
           {activeMatch && (
             <div className="p-6 sm:p-8 rounded-3xl bg-slate-900 border border-slate-800 space-y-6 shadow-2xl">
               <div className="flex items-center justify-between border-b border-slate-800 pb-4">
@@ -199,9 +614,7 @@ export const AdminPanel: React.FC = () => {
                 </div>
               </div>
 
-              {/* Scoring Grid */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                {/* Player 1 Scoring Column */}
                 <div
                   className={`p-6 rounded-2xl border transition-all text-center space-y-4 ${
                     activeMatch.currentServerId === p1?.id
@@ -243,7 +656,6 @@ export const AdminPanel: React.FC = () => {
                   </div>
                 </div>
 
-                {/* Player 2 Scoring Column */}
                 <div
                   className={`p-6 rounded-2xl border transition-all text-center space-y-4 ${
                     activeMatch.currentServerId === p2?.id
@@ -286,7 +698,6 @@ export const AdminPanel: React.FC = () => {
                 </div>
               </div>
 
-              {/* Bottom Quick Controls */}
               <div className="flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-slate-800">
                 <button
                   onClick={() => undoPoint(activeMatch.id)}
@@ -306,7 +717,7 @@ export const AdminPanel: React.FC = () => {
         </div>
       )}
 
-      {/* Tab 2: Players Management */}
+      {/* Tab 3: Players Management */}
       {activeAdminTab === 'players' && (
         <div className="p-6 rounded-3xl bg-slate-900 border border-slate-800 space-y-6">
           <div className="flex items-center justify-between">
@@ -320,7 +731,6 @@ export const AdminPanel: React.FC = () => {
             </div>
           </div>
 
-          {/* Add New Player Bar */}
           <div className="p-4 rounded-2xl bg-slate-950 border border-slate-800 grid grid-cols-1 sm:grid-cols-3 gap-3 items-center">
             <input
               type="text"
@@ -357,7 +767,6 @@ export const AdminPanel: React.FC = () => {
             </button>
           </div>
 
-          {/* Players List Table */}
           <div className="overflow-x-auto rounded-2xl border border-slate-800">
             <table className="w-full text-left text-xs sm:text-sm text-slate-300">
               <thead className="bg-slate-950 text-slate-400 uppercase font-bold text-xs">
@@ -460,137 +869,6 @@ export const AdminPanel: React.FC = () => {
         </div>
       )}
 
-      {/* Tab 3: Matches Management */}
-      {activeAdminTab === 'matches' && (
-        <div className="p-6 rounded-3xl bg-slate-900 border border-slate-800 space-y-6">
-          <div className="flex items-center justify-between">
-            <div>
-              <h3 className="text-lg sm:text-xl font-bold text-white">
-                Gestión de Partidos y Cruces
-              </h3>
-              <p className="text-xs text-slate-400">
-                Cambia horarios, jugadores o asigna resultados manualmente con validación
-              </p>
-            </div>
-          </div>
-
-          <div className="space-y-3">
-            {state.matches.map((m) => {
-              const isEditing = editingMatch?.id === m.id;
-              const p1 = state.players.find((p) => p.id === m.player1Id);
-              const p2 = state.players.find((p) => p.id === m.player2Id);
-
-              return (
-                <div
-                  key={m.id}
-                  className="p-4 rounded-2xl bg-slate-950/70 border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
-                >
-                  <div className="flex items-center space-x-3">
-                    <span className="font-extrabold text-amber-400 text-sm">#{m.matchNumber}</span>
-                    <div>
-                      <div className="text-sm font-bold text-white">
-                        {p1 ? p1.name : m.sourceDesc1 || 'TBD'} vs{' '}
-                        {p2 ? p2.name : m.sourceDesc2 || 'TBD'}
-                      </div>
-                      <div className="text-xs text-slate-400">
-                        {m.phase} • {m.scheduledTime}h • Marcador: {m.score1} - {m.score2} ({m.status})
-                      </div>
-                    </div>
-                  </div>
-
-                  {isEditing ? (
-                    <div className="flex flex-wrap items-center gap-2">
-                      <input
-                        type="time"
-                        value={editingMatch.scheduledTime}
-                        onChange={(e) =>
-                          setEditingMatch({ ...editingMatch, scheduledTime: e.target.value })
-                        }
-                        className="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-xs text-white"
-                      />
-                      <input
-                        type="number"
-                        placeholder="P1"
-                        value={editingMatch.score1}
-                        onChange={(e) =>
-                          setEditingMatch({
-                            ...editingMatch,
-                            score1: parseInt(e.target.value, 10) || 0
-                          })
-                        }
-                        className="w-14 px-2 py-1 bg-slate-900 border border-slate-700 rounded text-xs text-white text-center"
-                      />
-                      <input
-                        type="number"
-                        placeholder="P2"
-                        value={editingMatch.score2}
-                        onChange={(e) =>
-                          setEditingMatch({
-                            ...editingMatch,
-                            score2: parseInt(e.target.value, 10) || 0
-                          })
-                        }
-                        className="w-14 px-2 py-1 bg-slate-900 border border-slate-700 rounded text-xs text-white text-center"
-                      />
-                      <button
-                        onClick={() => {
-                          const finished = isMatchFinished(
-                            editingMatch.score1,
-                            editingMatch.score2,
-                            state.config.pointsToWin,
-                            state.config.minimumWinningDifference
-                          );
-                          const winnerId = finished
-                            ? editingMatch.score1 > editingMatch.score2
-                              ? editingMatch.player1Id
-                              : editingMatch.player2Id
-                            : null;
-
-                          updateMatch(editingMatch.id, {
-                            scheduledTime: editingMatch.scheduledTime,
-                            score1: editingMatch.score1,
-                            score2: editingMatch.score2,
-                            status: finished ? 'FINALIZADO' : 'EN_JUEGO',
-                            winnerId
-                          });
-                          setEditingMatch(null);
-                          showFeedback('Partido actualizado correctamente');
-                        }}
-                        className="px-3 py-1 rounded bg-emerald-600 text-white font-bold text-xs"
-                      >
-                        Guardar
-                      </button>
-                      <button
-                        onClick={() => setEditingMatch(null)}
-                        className="px-3 py-1 rounded bg-slate-800 text-slate-300 text-xs"
-                      >
-                        Cancelar
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="flex items-center space-x-2">
-                      <button
-                        onClick={() => setEditingMatch(m)}
-                        className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold flex items-center space-x-1"
-                      >
-                        <Edit2 className="w-3.5 h-3.5" />
-                        <span>Editar</span>
-                      </button>
-                      <button
-                        onClick={() => setActiveMatchId(m.id)}
-                        className="px-3 py-1.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-xs font-semibold"
-                      >
-                        Puntuar en Vivo
-                      </button>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
       {/* Tab 4: Config */}
       {activeAdminTab === 'config' && (
         <div className="p-6 rounded-3xl bg-slate-900 border border-slate-800 space-y-6">
@@ -683,7 +961,6 @@ export const AdminPanel: React.FC = () => {
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {/* Simulate Phase 1 */}
             <div className="p-5 rounded-2xl bg-indigo-950/30 border border-indigo-500/30 space-y-3">
               <div className="flex items-center space-x-2 text-indigo-400 font-bold text-sm">
                 <Sparkles className="w-5 h-5" />
@@ -703,7 +980,6 @@ export const AdminPanel: React.FC = () => {
               </button>
             </div>
 
-            {/* Tournament Reset */}
             <div className="p-5 rounded-2xl bg-rose-950/30 border border-rose-500/30 space-y-3">
               <div className="flex items-center space-x-2 text-rose-400 font-bold text-sm">
                 <AlertTriangle className="w-5 h-5" />
@@ -721,7 +997,6 @@ export const AdminPanel: React.FC = () => {
             </div>
           </div>
 
-          {/* Reset Confirmation Modal */}
           {showResetConfirm && (
             <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-fade-in">
               <div className="p-6 rounded-2xl bg-slate-900 border border-slate-700 max-w-sm w-full space-y-4 shadow-2xl">

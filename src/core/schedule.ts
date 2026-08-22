@@ -79,10 +79,6 @@ export function validateInitialSchedule(
 
 /**
  * Genera el calendario inicial equilibrado con 10 partidos y horarios calculados.
- * Jugadores ordenados por nivel:
- * Muy buenos: 3
- * Nivel medio: 4
- * Más flojos: 3
  */
 export function generateBalancedInitialSchedule(
   players: Player[],
@@ -90,37 +86,9 @@ export function generateBalancedInitialSchedule(
   durationMinutes: number = 10,
   tournamentId: string = 'torneo-2026'
 ): Match[] {
-  // Asegurar 10 jugadores
   if (players.length !== 10) {
     throw new Error('Se requieren exactamente 10 jugadores para generar el calendario.');
   }
-
-  // Distribución equilibrada (Evita cruces entre los 3 mejores en fase inicial):
-  // Jugadores:
-  // 1: Alejandro Viñeta (Muy bueno)
-  // 2: Pol Ginebra (Muy bueno)
-  // 3: Joan Ginebra (Muy bueno)
-  // 4: Alex Viñeta (Medio)
-  // 5: Guille Morales (Medio)
-  // 6: Fran Montobio (Medio)
-  // 7: Elisabet Ginebra (Medio)
-  // 8: Imma Ginebra (Flojo)
-  // 9: Gabriel Ginebra (Flojo)
-  // 10: Anna Ginebra (Flojo)
-  
-  // Matriz 2-regular conexa en grafo de 10 vértices:
-  // Cada vértice tiene grado 2 (exactamente 2 partidos por jugador)
-  // Emparejamientos (índices 0-9):
-  // 1. P0 (Alejandro) vs P3 (Alex Viñeta) [Muy bueno vs Medio]
-  // 2. P1 (Pol) vs P4 (Guille) [Muy bueno vs Medio]
-  // 3. P2 (Joan) vs P5 (Fran) [Muy bueno vs Medio]
-  // 4. P6 (Elisabet) vs P7 (Imma) [Medio vs Flojo]
-  // 5. P8 (Gabriel) vs P9 (Anna) [Flojo vs Flojo]
-  // 6. P0 (Alejandro) vs P6 (Elisabet) [Muy bueno vs Medio]
-  // 7. P1 (Pol) vs P7 (Imma) [Muy bueno vs Flojo]
-  // 8. P2 (Joan) vs P8 (Gabriel) [Muy bueno vs Flojo]
-  // 9. P3 (Alex) vs P9 (Anna) [Medio vs Flojo]
-  // 10. P4 (Guille) vs P5 (Fran) [Medio vs Medio]
 
   const pairings: [number, number][] = [
     [0, 3], // P1 vs P4
@@ -185,6 +153,45 @@ export function calculateMatchTime(
 }
 
 /**
+ * Recalcula todos los horarios del calendario secuencialmente según la hora de inicio e intervalo.
+ */
+export function recalculateAllMatchTimes(
+  matches: Match[],
+  startTime: string,
+  durationMinutes: number
+): Match[] {
+  return matches.map((m, idx) => ({
+    ...m,
+    scheduledTime: calculateMatchTime(startTime, idx, durationMinutes),
+    updatedAt: new Date().toISOString()
+  }));
+}
+
+/**
+ * Desplaza (adelanta o retrasa) el horario de los partidos pendientes en X minutos.
+ */
+export function shiftPendingMatchTimes(
+  matches: Match[],
+  minutesDelta: number
+): Match[] {
+  return matches.map(m => {
+    if (m.status === 'PENDIENTE') {
+      const [hStr, mStr] = m.scheduledTime.split(':');
+      let totalMins = (parseInt(hStr, 10) || 0) * 60 + (parseInt(mStr, 10) || 0) + minutesDelta;
+      if (totalMins < 0) totalMins += 24 * 60;
+      const newH = Math.floor(totalMins / 60) % 24;
+      const newM = totalMins % 60;
+      return {
+        ...m,
+        scheduledTime: `${newH.toString().padStart(2, '0')}:${newM.toString().padStart(2, '0')}`,
+        updatedAt: new Date().toISOString()
+      };
+    }
+    return m;
+  });
+}
+
+/**
  * Crea la plantilla de partidos para las fases eliminatorias y de consolación
  */
 export function createPlayoffMatchTemplates(
@@ -192,18 +199,6 @@ export function createPlayoffMatchTemplates(
   durationMinutes: number = 10,
   tournamentId: string = 'torneo-2026'
 ): Match[] {
-  // 10 partidos iniciales finalizan aprox a las 12:40 (11:00 a 12:30 inicio M10 -> 12:40 fin)
-  // Consolación y Cuartos de Final:
-  // M11: Consolación (9º vs 10º) -> 12:40
-  // M12: QF1 (1º vs 8º) -> 12:50
-  // M13: QF2 (2º vs 7º) -> 13:00
-  // M14: QF3 (3º vs 6º) -> 13:10
-  // M15: QF4 (4º vs 5º) -> 13:20
-  // M16: Semifinal 1 -> 13:35
-  // M17: Semifinal 2 -> 13:45
-  // M18: 3º y 4º Puesto -> 14:00
-  // M19: Gran Final -> 14:15
-
   const templates: {
     bracketCode: string;
     phase: Match['phase'];
